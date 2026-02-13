@@ -1,67 +1,79 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
-
-// Increase the limit to accept large audio files
 app.use(bodyParser.json({ limit: '50mb' }));
 
 app.post('/', (req, res) => {
-    try {
-        console.log('Received conversion request...');
+    // Generate unique temp filenames
+    const tempId = Date.now();
+    const inputPath = path.join('/tmp', `input_${tempId}.pcm`);
+    const outputPath = path.join('/tmp', `output_${tempId}.ogg`);
 
-        // 1. Extract the Base64 audio from the Gemini JSON structure
-        // The structure matches what you set in your n8n "Convert to ogg" node
+    try {
         const candidates = req.body.candidates;
-        
-        if (!candidates || !candidates[0] || !candidates[0].content) {
-            console.error('Invalid JSON structure received');
-            return res.status(400).send('Invalid JSON structure');
+        if (!candidates || !candidates[0]) {
+            return res.status(400).send('Invalid JSON');
         }
 
+        // 1. Save the raw PCM audio to a file on disk
         const base64Data = candidates[0].content.parts[0].inlineData.data;
-        const rawBuffer = Buffer.from(base64Data, 'base64');
+        fs.writeFileSync(inputPath, Buffer.from(base64Data, 'base64'));
 
-        // 2. Spawn FFmpeg
-        // Input: 24kHz, 1 channel, s16le (Gemini Default) -> Output: OGG Opus (WhatsApp Compatible)
+        // 2. Convert using FFmpeg
+        // Reading from a file allows FFmpeg to calculate the correct duration headers
         const ffmpeg = spawn('ffmpeg', [
-            '-f', 's16le',       // Input format: Signed 16-bit Little Endian
-            '-ar', '24000',      // Input Sample Rate: 24kHz
-            '-ac', '1',          // Input Channels: 1
-            '-i', 'pipe:0',      // Read from Standard Input
-            '-c:a', 'libopus',   // Output Codec: Opus
-            '-b:a', '16k',       // Bitrate: 16k (good for voice)
-            '-f', 'ogg',         // Output format: OGG
-            'pipe:1'             // Write to Standard Output
+            '-y',                // Overwrite output
+            '-f', 's16le',       // Input: Signed 16-bit Little Endian
+            '-ar', '24000',      // Input: 24kHz
+            '-ac', '1',          // Input: 1 Channel
+            '-i', inputPath,     // Read from the temp file
+            '-c:a', 'libopus',   // Output: Opus codec (Required for WhatsApp PTT)
+            '-b:a', '16k',       // Bitrate
+            '-application', 'voip', // Optimize for voice
+            outputPath           // Write to the temp file
         ]);
 
-        // 3. Pipe the output directly to the response
-        res.setHeader('Content-Type', 'audio/ogg');
-        ffmpeg.stdout.pipe(res);
+        ffmpeg.on('close', (code) => {
+            if (code === 0) {
+                // 3. Send the file back with the correct Content-Type
+                res.setHeader('Content-Type', 'audio/ogg; codecs=opus');
+                
+                // Create a read stream and pipe it to the response
+                const stream = fs.createReadStream(outputPath);
+                stream.pipe(res);
 
-        // 4. Handle Errors
-        ffmpeg.stderr.on('data', (data) => {
-            // FFmpeg logs to stderr, uncomment next line to debug if needed
-            // console.log(`FFmpeg Log: ${data}`);
+                // 4. Cleanup files after sending
+                stream.on('end', () => {
+                    fs.unlink(inputPath, () => {});
+                    fs.unlink(outputPath, () => {});
+                });
+                stream.on('error', (err) => {
+                    console.error('Stream error:', err);
+                    res.end(); 
+                });
+            } else {
+                console.error('FFmpeg failed with code', code);
+                res.status(500).send('Conversion Failed');
+                // Cleanup on error
+                fs.unlink(inputPath, () => {});
+                fs.unlink(outputPath, () => {});
+            }
         });
-
-        ffmpeg.on('error', (err) => {
-            console.error('FFmpeg process error:', err);
-            if (!res.headersSent) res.status(500).send('Conversion Failed');
-        });
-
-        // 5. Feed the audio data into FFmpeg
-        ffmpeg.stdin.write(rawBuffer);
-        ffmpeg.stdin.end();
 
     } catch (error) {
-        console.error('Server error:', error);
-        if (!res.headersSent) res.status(500).send('Server Error');
+        console.error('Server Error:', error);
+        res.status(500).send('Server Error');
+        // Try cleanup if paths exist
+        if (fs.existsSync(inputPath)) fs.unlink(inputPath, () => {});
+        if (fs.existsSync(outputPath)) fs.unlink(outputPath, () => {});
     }
 });
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-    console.log(`Server listening on port ${PORT}`);
+    console.log(`Server running on port ${PORT}`);
 });
